@@ -1,5 +1,5 @@
 ---
-title: "KCMO in SwedeHF: Part A, GDMT intensity 2014 to 2025"
+title: "KCMO in SwedeHF: Part A, GDMT intensity 2014 to 2023"
 subtitle: "Analysis code, data-quality checks, and aggregate outputs (SAP v0.2 draft)"
 format:
   html:
@@ -13,9 +13,9 @@ execute:
   warning: false
   message: false
 params:
-  data_path: "sim/data/sim_clean.RData"   # SIMULATED data for testing. Lina: point to the real extract.
+  data_path: "P:/k2_stat_heartfailure/Projects/20210525_shfdb4/dm/data/v423/rsdata423.RData"   # SIMULATED data for testing. Lina: point to the real extract.
   outpatient_value: "Out-patient"         # value of shf_location for outpatient rows (confirm, Q4)
-  esc_all: false                          # FALSE = shfdb5 targets (primary). TRUE = ESC convention for all drugs.
+  esc_all: false                          # FALSE = shfdb4 targets (primary). TRUE = ESC convention for all drugs.
   halt_on_stop: true                      # stop the run if the mapping stop rule is triggered
   outputs_dir: "outputs"
 ---
@@ -89,16 +89,16 @@ save_fig <- function(p, name, w = 7, h = 4.5) {
 
 ## 1. Target doses and substance mapping
 
-Primary target source is the shfdb5 definitions table. Enalapril, lisinopril, and carvedilol each carry their own convention flag (`use_esc`), so each can be switched to the ESC lowest-of-range value independently. Setting `esc_all: true` in the parameters switches every drug to ESC (sensitivity S2).
+Primary target source is the shfdb4 definitions table. Enalapril, lisinopril, and carvedilol each carry their own convention flag (`use_esc`), so each can be switched to the ESC lowest-of-range value independently. Setting `esc_all: true` in the parameters switches every drug to ESC (sensitivity S2).
 
 `evidence` is TRUE for agents that count toward the KCMO score for their class. A patient on a non-evidence agent scores 0 for that class. Ivabradine, vericiguat, digoxin, and hydralazine/isosorbide dinitrate are not in the score (Table 5).
 
-Dapagliflozin and empagliflozin have no shfdb5 target, so the SGLT2i class is binary (on = 1) as in SAP §3.3, and the ESC 10 mg value is used only for the dose check.
+Dapagliflozin and empagliflozin have no shfdb4 target, so the SGLT2i class is binary (on = 1) as in SAP §3.3, and the ESC 10 mg value is used only for the dose check.
 
 ```{r targets}
 tg <- function(cls, sub, ev, t5, te, uesc) {
   data.frame(class = cls, substance = sub, evidence = ev,
-             target_shfdb5 = as.numeric(t5), target_esc = as.numeric(te),
+             target_shfdb4 = as.numeric(t5), target_esc = as.numeric(te),
              use_esc = uesc, stringsAsFactors = FALSE)
 }
 targets <- rbind(
@@ -114,7 +114,7 @@ targets <- rbind(
      c(10, 100, 200, NA), c(10, 50, 200, 10), c(FALSE, FALSE, FALSE, FALSE)),
   tg("BB", c("Atenolol", "Betaxolol", "Labetalol", "Pindolol", "Propanolol", "Sotalol", "Timolol"), FALSE,
      c(100, 40, 400, 15, 640, 320, 60), NA, FALSE),
-  tg("MRA", c("Eplerenone", "Spironolactone"), TRUE,
+  tg("MRA", c("Eplerenon", "Spironalakton"), TRUE,
      c(50, 50), c(50, 50), c(FALSE, FALSE)),
   tg("SGLT2", c("Dapagliflozin", "Empagliflozin"), TRUE,
      c(NA, NA), c(10, 10), c(FALSE, FALSE)),
@@ -122,7 +122,7 @@ targets <- rbind(
      c(NA, NA), c(NA, NA), c(FALSE, FALSE))
 )
 
-# shfdb5 %TD for ARNi, keyed by the dose string (sacubitril/valsartan, mg/24 h).
+# shfdb4 %TD for ARNi, keyed by the dose string (sacubitril/valsartan, mg/24 h).
 # "0/0" is treated as missing (Q6).
 arni_lookup <- data.frame(
   arnidose = c("24/26", "48/52", "49/51", "61/64", "73/77", "85/90", "97/103", "98/102",
@@ -137,7 +137,7 @@ arni_lookup <- data.frame(
 mk_targets <- function(esc_all) {
   t <- targets
   t$use_esc_eff <- if (esc_all) TRUE else t$use_esc
-  t$target_eff <- ifelse(t$use_esc_eff, t$target_esc, t$target_shfdb5)
+  t$target_eff <- ifelse(t$use_esc_eff, t$target_esc, t$target_shfdb4)
   t$target_eff[t$class == "SGLT2"] <- t$target_esc[t$class == "SGLT2"]
   t
 }
@@ -226,7 +226,15 @@ build_rows <- function(dat, esc_all) {
   d <- d[!is.na(d$shf_location) & d$shf_location == params$outpatient_value, ]
   flow$rows_outpatient <- cnt(d$year)
 
-  d <- d[!is.na(d$shf_ef) & d$shf_ef < 40 & !is.na(d$sos_durationhf) & d$sos_durationhf >= 90, ]
+  d <- d[!is.na(d$shf_ef) & d$shf_ef %in% c("<30", "30-39") & !is.na(d$sos_durationhf) & d$sos_durationhf >= 90, ] 
+  # LB comments:
+  
+  # There is a variable (shf_efproc) that contains EF as a continous variable, but shf_ef is categorical. The continous ef variable only contains a sub fraction of all EFs, see https://kiheartfailure.github.io/shfdb4/statistics/ (in swedehf ef can be entered either as a continuous or a categorical variable). 
+  
+  # shf_durationhf is probably more reliable than sos_durationhf but only has values <6/>6 months
+  
+  # there are multiple registrations / patient in SwedeHF. Perhaps select first/last registration / patient?
+  
   flow$rows_ef_duration <- cnt(d$year)
 
   yes1 <- function(x) !is.na(x) & x == "Yes"
@@ -346,10 +354,10 @@ mapping <- bind_rows(
   map_one(pop$shf_mra, pop$shf_mrasub, "MRA", targets),
   map_one(pop$shf_sglt2i, pop$shf_sglt2isub, "SGLT2", targets)
 ) %>%
-  left_join(targets %>% select(substance, evidence, target_shfdb5, target_esc), by = c("sub" = "substance")) %>%
+  left_join(targets %>% select(substance, evidence, target_shfdb4, target_esc), by = c("sub" = "substance")) %>%
   mutate(status = case_when(
     is.na(evidence) ~ "NOT IN TABLE (resolve before run)",
-    evidence & is.na(target_shfdb5) & class != "SGLT2" ~ "in score, no shfdb5 target (Q11)",
+    evidence & is.na(target_shfdb4) & class != "SGLT2" ~ "in score, no shfdb4 target (Q11)",
     evidence ~ "in score",
     TRUE ~ "non-evidence (scores 0)")) %>%
   rename(substance = sub) %>%
@@ -360,12 +368,12 @@ show_tab(mapping, "Substances in the population and their mapping status")
 
 ### 4.3 ARNi parse check
 
-The sacubitril component of the dose string should match the shfdb5 %TD lookup within 2 percentage points, with the shfdb5 cap at 100 percent applied (doses at or above 194 mg are all 100 percent in shfdb5). Mismatches would indicate a parse or lookup problem. Please confirm the cap with the registry team (Q6).
+The sacubitril component of the dose string should match the shfdb4 %TD lookup within 2 percentage points, with the shfdb4 cap at 100 percent applied (doses at or above 194 mg are all 100 percent in shfdb4). Mismatches would indicate a parse or lookup problem. Please confirm the cap with the registry team (Q6).
 
 ```{r arni-parse}
 arni_chk <- pop[pop$st_arni == "on", ]
 arni_chk$comp <- as.numeric(sub("/.*", "", arni_chk$shf_arnidose))
-arni_chk$pct_parse <- pmin(100, 100 * arni_chk$comp / 194)  # shfdb5 caps all doses at or above 194 mg at 100 percent
+arni_chk$pct_parse <- pmin(100, 100 * arni_chk$comp / 194)  # shfdb4 caps all doses at or above 194 mg at 100 percent
 arni_chk$year <- as.integer(format(arni_chk$shf_indexdtm, "%Y"))
 arni_chk$pct_lookup <- arni_lookup$pct_td[match(arni_chk$shf_arnidose, arni_lookup$arnidose)]
 arni_chk$mismatch <- abs(arni_chk$pct_parse - arni_chk$pct_lookup) > 2
@@ -375,14 +383,14 @@ write_out(arni_parse, "arni_parse_check.csv", "n_on")
 show_tab(suppress_small(arni_parse, "n_on"), "ARNi parse check by year (rows with 2 or more percentage points difference)")
 ```
 
-### 4.4 shfdb5 versus ESC targets
+### 4.4 shfdb4 versus ESC targets
 
-Where the two conventions differ, the primary (shfdb5) and sensitivity (ESC) results will differ. Carvedilol under ESC depends on weight, so it is listed separately.
+Where the two conventions differ, the primary (shfdb4) and sensitivity (ESC) results will differ. Carvedilol under ESC depends on weight, so it is listed separately.
 
 ```{r target-diff}
 diff_tab <- targets %>%
-  filter(!is.na(target_shfdb5) & !is.na(target_esc) & target_shfdb5 != target_esc) %>%
-  select(class, substance, target_shfdb5, target_esc, use_esc)
+  filter(!is.na(target_shfdb4) & !is.na(target_esc) & target_shfdb4 != target_esc) %>%
+  select(class, substance, target_shfdb4, target_esc, use_esc)
 n_users <- pop %>% summarise(
   Enalapril = sum(shf_aceisub %in% "Enalapril", na.rm = TRUE),
   Lisinopril = sum(shf_aceisub %in% "Lisinopril", na.rm = TRUE),
@@ -391,8 +399,8 @@ diff_tab$n_rows_population <- c(n_users$Enalapril, n_users$Lisinopril, n_users$C
 diff_tab$note <- ifelse(diff_tab$substance == "Carvedilol",
                         "ESC: 50 mg if weight 85 kg or less, 100 mg if above; missing weight uses 50",
                         "")
-write_out(diff_tab, "shfdb5_vs_esc.csv", "n_rows_population")
-show_tab(diff_tab, "Target differences between shfdb5 (primary) and ESC lowest-of-range (sensitivity)")
+write_out(diff_tab, "shfdb4_vs_esc.csv", "n_rows_population")
+show_tab(diff_tab, "Target differences between shfdb4 (primary) and ESC lowest-of-range (sensitivity)")
 ```
 
 ### 4.5 Stop rule
@@ -717,6 +725,7 @@ Primary model: GEE on one row per patient-year, identity link, exchangeable corr
 Sensitivity models vary the row rule, the working correlation, and the target convention. The era-standardized series is shown for completeness, but its level is not comparable with the fixed series.
 
 ```{r models}
+#| eval: false
 read_extract <- function(path) {
   if (grepl("\\.(RData|rda)$", path, ignore.case = TRUE)) {
     e <- new.env(); load(path, envir = e); get(ls(e)[1], envir = e)
@@ -769,7 +778,7 @@ x_latest <- gee_prep(py3, "val")
 raw_dat  <- read_extract(params$data_path)
 P_alt    <- build_rows(raw_dat, !params$esc_all)
 py3_alt  <- pick_py(P_alt$rows, "kcmo3", "latest")
-alt_label <- if (params$esc_all) "S2: shfdb5 targets (alternate)" else "S2: ESC targets throughout"
+alt_label <- if (params$esc_all) "S2: shfdb4 targets (alternate)" else "S2: ESC targets throughout"
 
 trend_sens <- rbind(
   gee_trend(x_latest, "exchangeable", "Primary: fixed 3-class, latest row per year"),
@@ -785,6 +794,14 @@ show_tab(suppress_small(trend_sens, "n_py"), "GEE trend estimates: 2014 to 2025 
 pw <- pw_slopes(x_latest)
 write_out(pw, "piecewise_slopes.csv")
 show_tab(pw, "Piecewise linear slopes by guideline era (points per year, 95% CI)")
+
+# LB comment: 
+#   Error in `geeglm()`:
+# ! Model matrix is rank deficient; geeglm can not proceed
+# Backtrace:
+#     ▆
+#  1. └─global pw_slopes(x_latest)
+#  2.   └─geepack::geeglm(...)
 ```
 
 ## 9. Table 5: non-core therapy (descriptive, outside the score)
@@ -841,3 +858,12 @@ cat(paste0("  ", list.files(params$outputs_dir, recursive = TRUE)), sep = "\n")
 - The fixed three-class series is the comparability check; the era-standardized series changes definition in 2021 (SGLT2i added), so its level is not comparable across that boundary.
 - The registry does not record a reason for dose reduction, so down-titration is a dose change, not an intolerance.
 - Population: outpatients with EF below 40 percent (D11) and HF duration of at least 90 days.
+
+## R session information {#sessioninfo}
+
+```{r sessinfo}
+
+paste0("Quarto version: ", quarto::quarto_version())
+
+sessionInfo()
+```
