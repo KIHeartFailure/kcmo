@@ -834,7 +834,19 @@ p6 <- compl %>% filter(n_rows >= 10, field %in% c("ARNi dose string (use = Yes)"
 save_fig(p6, "fig6_completeness", h = 4.8)
 ```
 
-## 11. Run record and output files
+## 11. Substances for medications
+
+```{r medsub"}
+load(params$data_path)
+
+rsdata423 %>% count(shf_aceisub)
+rsdata423 %>% count(shf_arbsub)
+rsdata423 %>% count(shf_bblsub)
+rsdata423 %>% count(shf_mrasub)
+rsdata423 %>% count(shf_sglt2isub)
+```
+
+## 12. Run record and output files
 
 Send back the contents of `outputs/` (CSV tables and figures) and this rendered HTML. Do not send the data.
 
