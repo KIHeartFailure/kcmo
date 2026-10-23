@@ -1,0 +1,843 @@
+---
+title: "KCMO in SwedeHF: Part A, GDMT intensity 2014 to 2025"
+subtitle: "Analysis code, data-quality checks, and aggregate outputs (SAP v0.2 draft)"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show code"
+execute:
+  echo: true
+  warning: false
+  message: false
+params:
+  data_path: "sim/data/sim_clean.RData"   # SIMULATED data for testing. Lina: point to the real extract.
+  outpatient_value: "Out-patient"         # value of shf_location for outpatient rows (confirm, Q4)
+  esc_all: false                          # FALSE = shfdb5 targets (primary). TRUE = ESC convention for all drugs.
+  halt_on_stop: true                      # stop the run if the mapping stop rule is triggered
+  outputs_dir: "outputs"
+---
+
+## Purpose and status
+
+This file runs the Part A analysis in the SAP (v0.2 draft): the trend in fixed three-class KCMO from 2014 to 2025, the KCMO definitions, and the data-quality checks that must pass before any trend is read. It returns aggregate tables only. No row-level data are written, displayed, or returned.
+
+Status: draft. Analysis is not locked. Decisions D10 (highest-in-year as sensitivity) and D11 (EF below 40 percent) are applied as written in the SAP. Open questions for the registry team are listed in the README.
+
+```{r setup}
+options(knitr.kable.NA = "")
+req <- c("dplyr", "tidyr", "ggplot2", "geepack", "knitr", "MetBrewer")
+missing_pkgs <- req[!vapply(req, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install these packages first: install.packages(c(",
+       paste(sprintf('"%s"', missing_pkgs), collapse = ", "), "))")
+}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(geepack)
+})
+theme_set(theme_minimal())
+dir.create(params$outputs_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(params$outputs_dir, "figures"), showWarnings = FALSE, recursive = TRUE)
+
+yrs <- 2014:2025
+
+# Okabe-Ito colour-blind-safe palette (not in MetBrewer)
+okabe_ito <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442",
+               "#0072B2", "#D55E00", "#CC79A7", "#000000")
+```
+
+## Helper functions
+
+Small-cell suppression: any row with a count between 1 and 9 has its statistics blanked before it is shown or written.
+
+```{r helpers}
+suppress_small <- function(df, count_cols) {
+  # 1. any count of 1 to 9 is blanked (the count itself is disclosive)
+  # 2. statistics in any row with a small count are blanked
+  small <- rep(FALSE, nrow(df))
+  for (v in count_cols) {
+    cell <- !is.na(df[[v]]) & df[[v]] > 0 & df[[v]] < 10
+    df[[v]][cell] <- NA
+    small <- small | cell
+  }
+  stat_cols <- setdiff(names(df)[vapply(df, is.numeric, logical(1))], c(count_cols, "year", "threshold"))
+  for (v in stat_cols) df[[v]][small] <- NA
+  df
+}
+
+write_out <- function(df, name, count_cols = character(0)) {
+  df <- suppress_small(df, count_cols)
+  write.csv(df, file.path(params$outputs_dir, name), row.names = FALSE)
+  invisible(df)
+}
+
+show_tab <- function(df, caption) {
+  knitr::kable(df, caption = caption, digits = 2)
+}
+
+save_fig <- function(p, name, w = 7, h = 4.5) {
+  print(p)
+  ggsave(file.path(params$outputs_dir, "figures", paste0(name, ".png")), p,
+         width = w, height = h, dpi = 150, bg = "white")
+}
+```
+
+## 1. Target doses and substance mapping
+
+Primary target source is the shfdb5 definitions table. Enalapril, lisinopril, and carvedilol each carry their own convention flag (`use_esc`), so each can be switched to the ESC lowest-of-range value independently. Setting `esc_all: true` in the parameters switches every drug to ESC (sensitivity S2).
+
+`evidence` is TRUE for agents that count toward the KCMO score for their class. A patient on a non-evidence agent scores 0 for that class. Ivabradine, vericiguat, digoxin, and hydralazine/isosorbide dinitrate are not in the score (Table 5).
+
+Dapagliflozin and empagliflozin have no shfdb5 target, so the SGLT2i class is binary (on = 1) as in SAP §3.3, and the ESC 10 mg value is used only for the dose check.
+
+```{r targets}
+tg <- function(cls, sub, ev, t5, te, uesc) {
+  data.frame(class = cls, substance = sub, evidence = ev,
+             target_shfdb5 = as.numeric(t5), target_esc = as.numeric(te),
+             use_esc = uesc, stringsAsFactors = FALSE)
+}
+targets <- rbind(
+  tg("ACEI", c("Captopril", "Enalapril", "Lisinopril", "Ramipril", "Trandolapril"), TRUE,
+     c(150, 40, 35, 10, 4), c(150, 20, 20, 10, 4), c(FALSE, FALSE, FALSE, FALSE, FALSE)),
+  tg("ACEI", c("Cilazapril", "Fosinopril", "Kinapril", "Perindopril"), FALSE,
+     c(5, 40, 20, 10), NA, FALSE),   # "Kinapril" as spelled in the registry (quinapril? Q7)
+  tg("ARB", c("Candesartan", "Losartan", "Valsartan"), TRUE,
+     c(32, 150, 320), c(32, 150, 320), FALSE),
+  tg("ARB", c("Eprosartan", "Irbesartan", "Telmisartan"), FALSE,
+     c(600, 300, 80), NA, FALSE),
+  tg("BB", c("Bisoprolol", "Carvedilol", "Metoprolol", "Nebivolol"), TRUE,
+     c(10, 100, 200, NA), c(10, 50, 200, 10), c(FALSE, FALSE, FALSE, FALSE)),
+  tg("BB", c("Atenolol", "Betaxolol", "Labetalol", "Pindolol", "Propanolol", "Sotalol", "Timolol"), FALSE,
+     c(100, 40, 400, 15, 640, 320, 60), NA, FALSE),
+  tg("MRA", c("Eplerenone", "Spironolactone"), TRUE,
+     c(50, 50), c(50, 50), c(FALSE, FALSE)),
+  tg("SGLT2", c("Dapagliflozin", "Empagliflozin"), TRUE,
+     c(NA, NA), c(10, 10), c(FALSE, FALSE)),
+  tg("SGLT2", c("Ertugliflozin", "Kanagliflozin"), FALSE,
+     c(NA, NA), c(NA, NA), c(FALSE, FALSE))
+)
+
+# shfdb5 %TD for ARNi, keyed by the dose string (sacubitril/valsartan, mg/24 h).
+# "0/0" is treated as missing (Q6).
+arni_lookup <- data.frame(
+  arnidose = c("24/26", "48/52", "49/51", "61/64", "73/77", "85/90", "97/103", "98/102",
+               "121/129", "122/128", "145/155", "146/154", "157/168", "170/180",
+               "194/206", "195/205", "218/232", "219/231", "242/258", "243/257",
+               "267/283", "292/308", "316/334", "340/360"),
+  pct_td = c(12, 25, 25, 31, 37, 44, 50, 50, 62, 62, 75, 75, 81, 87,
+             100, 100, 100, 100, 100, 100, 100, 100, 100, 100),
+  stringsAsFactors = FALSE
+)
+
+mk_targets <- function(esc_all) {
+  t <- targets
+  t$use_esc_eff <- if (esc_all) TRUE else t$use_esc
+  t$target_eff <- ifelse(t$use_esc_eff, t$target_esc, t$target_shfdb5)
+  t$target_eff[t$class == "SGLT2"] <- t$target_esc[t$class == "SGLT2"]
+  t
+}
+```
+
+## 2. Row-level status for each class
+
+Each row gets a status per class. Only "on", "not_on", and "non_evidence" count as valid. Everything else (unknown, unmapped, dose missing, no target) is excluded from the score and counted in the flow table, not silently scored as zero.
+
+- `not_on`: use = No, and the field was captured.
+- `non_evidence`: use = Yes with a non-evidence agent. Scored 0 for the class.
+- `not_captured`: before the field's capture date. Treated as unknown, not as No.
+
+```{r class-status}
+class_status <- function(use, sub, dose, cls, captured, tt, weight) {
+  tc <- tt[tt$class == cls, ]
+  m <- match(sub, tc$substance)
+  known <- !is.na(m)
+  evid  <- known & (tc$evidence[m] %in% TRUE)
+  tgt   <- tc$target_eff[m]
+  if (cls == "BB") {
+    cv <- !is.na(m) & sub %in% "Carvedilol" & (tc$use_esc_eff[m] %in% TRUE)
+    cv[is.na(cv)] <- FALSE
+    tgt[cv] <- ifelse(!is.na(weight[cv]) & weight[cv] > 85, 100, 50)  # ESC weight rule; missing weight = 50
+  }
+  st <- rep("unknown", length(use))
+  st[!captured] <- "not_captured"
+  no  <- captured & !is.na(use) & use == "No"
+  yes <- captured & !is.na(use) & use == "Yes"
+  st[no] <- "not_on"
+  st[yes & is.na(sub)] <- "unknown"
+  st[yes & !is.na(sub) & !known] <- "unmapped"
+  st[yes & known & !evid] <- "non_evidence"
+  st[yes & evid & is.na(dose)] <- "dose_missing"
+  st[yes & evid & !is.na(dose) & is.na(tgt)] <- "no_target"
+  st[yes & evid & !is.na(dose) & !is.na(tgt)] <- "on"
+
+  valid <- st %in% c("on", "not_on", "non_evidence")
+  p   <- rep(NA_real_, length(st))
+  raw <- rep(NA_real_, length(st))
+  on  <- st == "on"
+  raw[on] <- dose[on] / tgt[on]
+  p[on]   <- pmin(1, raw[on])
+  if (cls == "SGLT2") p[on] <- 1                 # binary class (SAP §3.3)
+  p[st %in% c("not_on", "non_evidence")] <- 0
+  list(st = st, valid = valid, p = p, raw = raw)
+}
+
+arni_status <- function(use, dose_str, captured) {
+  st <- rep("unknown", length(use))
+  st[!captured] <- "not_captured"
+  no  <- captured & !is.na(use) & use == "No"
+  yes <- captured & !is.na(use) & use == "Yes"
+  st[no] <- "not_on"
+  st[yes & (is.na(dose_str) | dose_str == "0/0")] <- "dose_missing"
+  st[yes & !is.na(dose_str) & dose_str != "0/0" & !(dose_str %in% arni_lookup$arnidose)] <- "unmapped"
+  st[yes & !is.na(dose_str) & dose_str %in% arni_lookup$arnidose] <- "on"
+  pct <- arni_lookup$pct_td[match(dose_str, arni_lookup$arnidose)] / 100
+  p   <- rep(NA_real_, length(st))
+  p[st == "on"]    <- pmin(1, pct[st == "on"])
+  p[st == "not_on"] <- 0
+  raw <- rep(NA_real_, length(st))
+  raw[st == "on"] <- pct[st == "on"]
+  list(st = st, valid = st %in% c("on", "not_on"), p = p, raw = raw)
+}
+```
+
+## 3. Building the analysis rows
+
+Filters in order, with counts kept for the flow table: calendar year 2014 to 2025; one row per patient per visit date; outpatient rows; EF below 40 percent; HF duration at least 90 days; no same-row combination of ACEi with ARB or ARNi. Then the class scores are computed and the three-class and four-class KCMO are assigned to rows that have complete, valid statuses.
+
+KCMO = 100 × (sum of class scores) / (number of score classes). Every class is eligible in this version (SAP L1, eligibility deferred), so the denominator is 3 for the fixed series and 4 for the SGLT2i series.
+
+```{r build-rows}
+build_rows <- function(dat, esc_all) {
+  tt <- mk_targets(esc_all)
+  d <- dat
+  d$date <- as.Date(d$shf_indexdtm)
+  d$year <- as.integer(format(d$date, "%Y"))
+  cnt <- function(x) as.integer(table(factor(x, levels = yrs)))
+
+  d <- d[d$year %in% yrs, ]
+  d <- d[!duplicated(paste(d$lopnr, d$date)), ]
+  flow <- data.frame(year = yrs, rows_window_dedup = cnt(d$year))
+
+  d <- d[!is.na(d$shf_location) & d$shf_location == params$outpatient_value, ]
+  flow$rows_outpatient <- cnt(d$year)
+
+  d <- d[!is.na(d$shf_ef) & d$shf_ef < 40 & !is.na(d$sos_durationhf) & d$sos_durationhf >= 90, ]
+  flow$rows_ef_duration <- cnt(d$year)
+
+  yes1 <- function(x) !is.na(x) & x == "Yes"
+  conflict <- (yes1(d$shf_acei) & yes1(d$shf_arb)) |
+              (yes1(d$shf_arb) & yes1(d$shf_arni)) |
+              (yes1(d$shf_acei) & yes1(d$shf_arni))
+  d <- d[!conflict, ]
+  flow$rows_no_conflict <- cnt(d$year)
+
+  n <- nrow(d)
+  arni_cap <- d$date >= as.Date("2016-04-20")
+  sg_cap   <- d$date >= as.Date("2021-04-28")
+  acei <- class_status(d$shf_acei, d$shf_aceisub, d$shf_aceidose, "ACEI", rep(TRUE, n), tt, d$shf_weight)
+  arb  <- class_status(d$shf_arb,  d$shf_arbsub,  d$shf_arbdose,  "ARB",  rep(TRUE, n), tt, d$shf_weight)
+  bb   <- class_status(d$shf_bbl,  d$shf_bblsub,  d$shf_bbldose,  "BB",   rep(TRUE, n), tt, d$shf_weight)
+  mra  <- class_status(d$shf_mra,  d$shf_mrasub,  d$shf_mradose,  "MRA",  rep(TRUE, n), tt, d$shf_weight)
+  sg   <- class_status(d$shf_sglt2i, d$shf_sglt2isub, d$shf_sglt2idose, "SGLT2", sg_cap, tt, d$shf_weight)
+  arni <- arni_status(d$shf_arni, d$shf_arnidose, arni_cap)
+
+  # RAS slot: ACEi, ARB, or ARNi. ARNi is ignored before its capture date.
+  ras_ok <- acei$valid & arb$valid & (arni$st == "not_captured" | arni$valid)
+  ras_p  <- ifelse(ras_ok, pmax(acei$p, arb$p, arni$p, na.rm = TRUE), NA_real_)
+  ras_on <- ras_ok & (acei$st == "on" | arb$st == "on" | arni$st == "on")
+  ras_raw <- pmax(acei$raw, arb$raw, arni$raw, na.rm = TRUE)
+
+  k3_ok <- ras_ok & bb$valid & mra$valid
+  kcmo3 <- ifelse(k3_ok, 100 * (ras_p + bb$p + mra$p) / 3, NA_real_)
+  k4_ok <- k3_ok & sg$valid & (d$date >= as.Date("2021-05-01"))
+  kcmo4 <- ifelse(k4_ok, 100 * (ras_p + bb$p + mra$p + sg$p) / 4, NA_real_)
+
+  # Stop rule: share of population rows with any class raw %TD above 2 (before the 100% cap).
+  raw_any <- pmax(ras_raw, bb$raw, mra$raw, sg$raw, na.rm = TRUE)
+  over2 <- !is.na(raw_any) & raw_any > 2
+
+  rows <- data.frame(
+    lopnr = d$lopnr, date = d$date, year = d$year,
+    age = d$shf_age, female = as.integer(d$shf_sex == "Female"),
+    nyha_hi = ifelse(is.na(d$shf_nyha), NA, d$shf_nyha %in% c("III", "IV")),
+    dig = d$shf_digoxin == "Yes", ivab = d$shf_sinusnodei == "Yes", nitr = d$shf_nitrate == "Yes",
+    ras_ok = ras_ok, ras_on = ras_on, p_ras = ras_p,
+    bb_valid = bb$valid, bb_on = bb$st == "on", p_bb = bb$p,
+    mra_valid = mra$valid, mra_on = mra$st == "on", p_mra = mra$p,
+    sg_valid = sg$valid & d$date >= as.Date("2021-05-01"), sg_on = sg$st == "on", p_sg = sg$p,
+    k3_ok = k3_ok, kcmo3 = kcmo3, kcmo4 = kcmo4,
+    over2 = over2,
+    stringsAsFactors = FALSE
+  )
+  pop <- d  # population rows for completeness and mapping checks
+  pop$st_acei <- acei$st; pop$st_arb <- arb$st; pop$st_arni <- arni$st
+  pop$st_bb <- bb$st; pop$st_mra <- mra$st; pop$st_sg <- sg$st
+  list(rows = rows, pop = pop, flow = flow, over2 = over2, n_pop = n)
+}
+
+P <- build_rows(
+  if (grepl("\\.(RData|rda)$", params$data_path, ignore.case = TRUE)) {
+    e <- new.env(); load(params$data_path, envir = e); get(ls(e)[1], envir = e)
+  } else {
+    read.csv(params$data_path, stringsAsFactors = FALSE)
+  },
+  params$esc_all
+)
+rows <- P$rows
+pop  <- P$pop
+cat("Population rows (outpatient, EF < 40, duration >= 90 days, no ACEi/ARB/ARNi conflict):", P$n_pop, "\n")
+```
+
+## 4. Data-quality checks (run before any trend is read)
+
+### 4.1 Structure and flow
+
+The flow table shows how many rows survive each filter in each year. Rows removed for missing or unmapped data are counted, not dropped silently.
+
+```{r flow}
+pick_py <- function(df, val_col, rule = c("latest", "highest", "first")) {
+  rule <- match.arg(rule)
+  x <- df[!is.na(df[[val_col]]), ]
+  x$val <- x[[val_col]]
+  x <- x[order(x$lopnr, x$year, x$date), ]
+  if (rule == "latest")  x <- x %>% group_by(lopnr, year) %>% slice_tail(n = 1) %>% ungroup()
+  if (rule == "first")   x <- x %>% group_by(lopnr, year) %>% slice_head(n = 1) %>% ungroup()
+  if (rule == "highest") x <- x %>% group_by(lopnr, year) %>% slice_max(order_by = val, n = 1, with_ties = FALSE) %>% ungroup()
+  x
+}
+
+py3 <- pick_py(rows, "kcmo3", "latest")
+py3_high <- pick_py(rows, "kcmo3", "highest")
+py3_first <- pick_py(rows, "kcmo3", "first")
+py4 <- pick_py(rows, "kcmo4", "latest")
+
+flow <- P$flow
+flow$rows_kcmo3_valid <- as.integer(table(factor(rows$year[rows$k3_ok], levels = yrs)))
+flow$patient_years_primary <- as.integer(table(factor(py3$year, levels = yrs)))
+flow$patients_primary_all_years <- length(unique(py3$lopnr))
+write_out(flow, "flow_by_year.csv", c("rows_window_dedup", "rows_outpatient", "rows_ef_duration",
+                                      "rows_no_conflict", "rows_kcmo3_valid", "patient_years_primary"))
+show_tab(suppress_small(flow, c("rows_window_dedup", "rows_outpatient", "rows_ef_duration",
+                                 "rows_no_conflict", "rows_kcmo3_valid", "patient_years_primary")),
+         "Rows and patient-years by calendar year (counts under 10 suppressed)")
+```
+
+### 4.2 Mapping: every substance in the population
+
+Each substance found in the population is listed with its status: in the score (evidence-based), in the table as non-evidence, or not in the table. Anything not in the table must be resolved before the first run.
+
+```{r mapping}
+map_one <- function(use, sub, cls, tt) {
+  x <- data.frame(use = use, sub = sub, stringsAsFactors = FALSE)
+  x <- x[!is.na(x$use) & x$use == "Yes" & !is.na(x$sub), ]
+  if (nrow(x) == 0) return(NULL)
+  x %>% group_by(sub) %>% summarise(n_rows = n(), .groups = "drop") %>%
+    mutate(class = cls)
+}
+mapping <- bind_rows(
+  map_one(pop$shf_acei, pop$shf_aceisub, "ACEI", targets),
+  map_one(pop$shf_arb, pop$shf_arbsub, "ARB", targets),
+  map_one(pop$shf_bbl, pop$shf_bblsub, "BB", targets),
+  map_one(pop$shf_mra, pop$shf_mrasub, "MRA", targets),
+  map_one(pop$shf_sglt2i, pop$shf_sglt2isub, "SGLT2", targets)
+) %>%
+  left_join(targets %>% select(substance, evidence, target_shfdb5, target_esc), by = c("sub" = "substance")) %>%
+  mutate(status = case_when(
+    is.na(evidence) ~ "NOT IN TABLE (resolve before run)",
+    evidence & is.na(target_shfdb5) & class != "SGLT2" ~ "in score, no shfdb5 target (Q11)",
+    evidence ~ "in score",
+    TRUE ~ "non-evidence (scores 0)")) %>%
+  rename(substance = sub) %>%
+  arrange(class, substance)
+write_out(mapping, "mapping_check.csv", "n_rows")
+show_tab(mapping, "Substances in the population and their mapping status")
+```
+
+### 4.3 ARNi parse check
+
+The sacubitril component of the dose string should match the shfdb5 %TD lookup within 2 percentage points, with the shfdb5 cap at 100 percent applied (doses at or above 194 mg are all 100 percent in shfdb5). Mismatches would indicate a parse or lookup problem. Please confirm the cap with the registry team (Q6).
+
+```{r arni-parse}
+arni_chk <- pop[pop$st_arni == "on", ]
+arni_chk$comp <- as.numeric(sub("/.*", "", arni_chk$shf_arnidose))
+arni_chk$pct_parse <- pmin(100, 100 * arni_chk$comp / 194)  # shfdb5 caps all doses at or above 194 mg at 100 percent
+arni_chk$year <- as.integer(format(arni_chk$shf_indexdtm, "%Y"))
+arni_chk$pct_lookup <- arni_lookup$pct_td[match(arni_chk$shf_arnidose, arni_lookup$arnidose)]
+arni_chk$mismatch <- abs(arni_chk$pct_parse - arni_chk$pct_lookup) > 2
+arni_parse <- arni_chk %>% filter(!is.na(year)) %>% group_by(year) %>%
+  summarise(n_on = n(), n_mismatch = sum(mismatch), .groups = "drop")
+write_out(arni_parse, "arni_parse_check.csv", "n_on")
+show_tab(suppress_small(arni_parse, "n_on"), "ARNi parse check by year (rows with 2 or more percentage points difference)")
+```
+
+### 4.4 shfdb5 versus ESC targets
+
+Where the two conventions differ, the primary (shfdb5) and sensitivity (ESC) results will differ. Carvedilol under ESC depends on weight, so it is listed separately.
+
+```{r target-diff}
+diff_tab <- targets %>%
+  filter(!is.na(target_shfdb5) & !is.na(target_esc) & target_shfdb5 != target_esc) %>%
+  select(class, substance, target_shfdb5, target_esc, use_esc)
+n_users <- pop %>% summarise(
+  Enalapril = sum(shf_aceisub %in% "Enalapril", na.rm = TRUE),
+  Lisinopril = sum(shf_aceisub %in% "Lisinopril", na.rm = TRUE),
+  Carvedilol = sum(shf_bblsub %in% "Carvedilol", na.rm = TRUE))
+diff_tab$n_rows_population <- c(n_users$Enalapril, n_users$Lisinopril, n_users$Carvedilol)[match(diff_tab$substance, c("Enalapril", "Lisinopril", "Carvedilol"))]
+diff_tab$note <- ifelse(diff_tab$substance == "Carvedilol",
+                        "ESC: 50 mg if weight 85 kg or less, 100 mg if above; missing weight uses 50",
+                        "")
+write_out(diff_tab, "shfdb5_vs_esc.csv", "n_rows_population")
+show_tab(diff_tab, "Target differences between shfdb5 (primary) and ESC lowest-of-range (sensitivity)")
+```
+
+### 4.5 Stop rule
+
+Share of population rows with any class dose above 2 times the target, before the 100 percent cap. If this exceeds 1 percent, the run stops and the mapping is reviewed before any trend is reported.
+
+```{r stop-rule}
+stop_tab <- data.frame(
+  population_rows = P$n_pop,
+  rows_any_class_over_2x = sum(P$over2),
+  share_over_2x = round(mean(P$over2), 4),
+  threshold = 0.01,
+  halt = mean(P$over2) > 0.01
+)
+write_out(stop_tab, "stop_rule.csv")
+show_tab(stop_tab, "Stop rule: dose-plausibility check")
+if (params$halt_on_stop && stop_tab$halt) {
+  stop("STOP RULE TRIGGERED: more than 1% of population rows have a dose above 2x target. ",
+       "Review the mapping table and the dose fields with the registry team before running trends. ",
+       "Send outputs/stop_rule.csv and outputs/mapping_check.csv back.")
+}
+```
+
+### 4.6 Completeness by year
+
+Non-missing proportion for each medication field (use, substance given use = Yes, dose given use = Yes) and for the clinical and eligibility-proxy fields. Cells with fewer than 10 rows are suppressed.
+
+```{r completeness}
+compl_one <- function(df, field, label, given = NULL) {
+  x <- df
+  if (!is.null(given)) x <- x[!is.na(x[[given[1]]]) & x[[given[1]]] == given[2], ]
+  if (nrow(x) == 0) return(NULL)
+  x %>% group_by(year) %>%
+    summarise(n_rows = n(), pct_nonmissing = round(100 * mean(!is.na(.data[[field]])), 1), .groups = "drop") %>%
+    mutate(field = label)
+}
+pop$year <- as.integer(format(pop$shf_indexdtm, "%Y"))
+compl <- bind_rows(
+  compl_one(pop, "shf_acei", "ACEi use"),
+  compl_one(pop, "shf_aceisub", "ACEi substance (use = Yes)", c("shf_acei", "Yes")),
+  compl_one(pop, "shf_aceidose", "ACEi dose (use = Yes)", c("shf_acei", "Yes")),
+  compl_one(pop, "shf_arb", "ARB use"),
+  compl_one(pop, "shf_arbsub", "ARB substance (use = Yes)", c("shf_arb", "Yes")),
+  compl_one(pop, "shf_arbdose", "ARB dose (use = Yes)", c("shf_arb", "Yes")),
+  compl_one(pop, "shf_arni", "ARNi use"),
+  compl_one(pop, "shf_arnidose", "ARNi dose string (use = Yes)", c("shf_arni", "Yes")),
+  compl_one(pop, "shf_bbl", "Beta-blocker use"),
+  compl_one(pop, "shf_bblsub", "BB substance (use = Yes)", c("shf_bbl", "Yes")),
+  compl_one(pop, "shf_bbldose", "BB dose (use = Yes)", c("shf_bbl", "Yes")),
+  compl_one(pop, "shf_mra", "MRA use"),
+  compl_one(pop, "shf_mrasub", "MRA substance (use = Yes)", c("shf_mra", "Yes")),
+  compl_one(pop, "shf_mradose", "MRA dose (use = Yes)", c("shf_mra", "Yes")),
+  compl_one(pop, "shf_sglt2i", "SGLT2i use"),
+  compl_one(pop, "shf_sglt2isub", "SGLT2i substance (use = Yes)", c("shf_sglt2i", "Yes")),
+  compl_one(pop, "shf_sglt2idose", "SGLT2i dose (use = Yes)", c("shf_sglt2i", "Yes")),
+  compl_one(pop, "shf_ef", "LVEF"),
+  compl_one(pop, "shf_nyha", "NYHA class"),
+  compl_one(pop, "shf_gfrckdepi", "eGFR (CKD-EPI 2021)"),
+  compl_one(pop, "shf_potassium", "Potassium"),
+  compl_one(pop, "shf_weight", "Weight"),
+  compl_one(pop, "shf_heartrate", "Heart rate"),
+  compl_one(pop, "sos_durationhf", "HF duration (sos_durationhf)"),
+  compl_one(pop, "sos_com_dialysis", "Dialysis (register)"),
+  compl_one(pop, "shf_device_cat", "Device therapy category")
+)
+write_out(compl, "completeness_by_year.csv", "n_rows")
+compl_wide <- compl %>% select(field, year, pct_nonmissing) %>%
+  pivot_wider(names_from = year, values_from = pct_nonmissing)
+show_tab(compl_wide, "Percent non-missing by field and year (blank = fewer than 10 rows)")
+```
+
+## 5. Trend analysis (Part A)
+
+### 5.1 KCMO by year
+
+Fixed three-class KCMO uses the same classes in every year (comparability check). The era-standardized series uses the fixed three-class score through 2020 and the four-class score from May 2021 onward (SAP §5). 2021 is a partial year for the four-class series.
+
+```{r kcmo-trend}
+kby <- py3 %>% group_by(year) %>% summarise(
+  n_py = n(),
+  mean_fixed3 = mean(val), median_fixed3 = median(val),
+  p10 = quantile(val, 0.1, names = FALSE), p25 = quantile(val, 0.25, names = FALSE),
+  p75 = quantile(val, 0.75, names = FALSE), p90 = quantile(val, 0.9, names = FALSE),
+  .groups = "drop")
+
+kby4 <- py4 %>% group_by(year) %>% summarise(n_py_4class = n(), mean_4class = mean(val), .groups = "drop")
+
+era_py <- bind_rows(
+  py3 %>% filter(year < 2021) %>% mutate(era_val = val),
+  py4 %>% filter(year >= 2021) %>% mutate(era_val = val)
+)
+kby_era <- era_py %>% group_by(year) %>% summarise(mean_era = mean(era_val), .groups = "drop")
+
+# Direct age-sex standardization to the pooled 2014 to 2025 mix (SAP §6.1)
+py3$agegrp <- cut(py3$age, c(-Inf, 65, 75, Inf), labels = c("<65", "65-74", "75+"))
+py3$strat <- paste(py3$agegrp, py3$female)
+w <- prop.table(table(py3$strat))
+sm <- py3 %>% group_by(year, strat) %>% summarise(m = mean(val), n = n(), .groups = "drop")
+sm$m[sm$n < 10] <- NA
+sm$w <- as.numeric(w[sm$strat])
+std <- sm %>% group_by(year) %>% summarise(
+  mean_std_agesex = if (n() == length(w) && all(!is.na(m))) sum(w * m) / sum(w) else NA_real_,
+  .groups = "drop")
+
+kcmo_tab <- kby %>% left_join(kby_era, by = "year") %>% left_join(kby4, by = "year") %>% left_join(std, by = "year")
+kcmo_tab <- kcmo_tab %>% mutate(across(where(is.numeric) & !matches("^n_"), ~ round(.x, 2)))
+write_out(kcmo_tab, "kcmo_by_year.csv", c("n_py", "n_py_4class"))
+show_tab(suppress_small(kcmo_tab, c("n_py", "n_py_4class")),
+         "KCMO by calendar year (primary: latest qualifying row per patient-year)")
+```
+
+```{r fig-kcmo, fig.cap = "Fixed three-class KCMO by year: mean with interquartile range (primary, latest row per patient-year)."}
+p1 <- kby %>% filter(n_py >= 10) %>%
+  ggplot(aes(year, mean_fixed3)) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), fill = "steelblue", alpha = 0.3) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = yrs) +
+  labs(x = "Calendar year", y = "KCMO Score") +
+  theme_minimal()
+save_fig(p1, "fig1_kcmo_fixed3")
+```
+
+### 5.2 Class prevalence and dose intensity
+
+```{r class-prev}
+class_summary <- function(df, pcol, label) {
+  df %>% group_by(year) %>% summarise(
+    class = label, n_py = n(),
+    pct_on = round(100 * mean(.data[[pcol]] > 0), 1),
+    mean_pct_target_users = round(100 * mean(.data[[pcol]][.data[[pcol]] > 0]), 1),
+    pct_users_ge50 = round(100 * mean(.data[[pcol]][.data[[pcol]] > 0] >= 0.5), 1),
+    pct_users_ge100 = round(100 * mean(.data[[pcol]][.data[[pcol]] > 0] >= 1), 1),
+    .groups = "drop")
+}
+prev <- bind_rows(
+  class_summary(py3, "p_ras", "RAS (ACEi, ARB, or ARNi)"),
+  class_summary(py3, "p_bb", "Beta-blocker (evidence-based)"),
+  class_summary(py3, "p_mra", "MRA"),
+  class_summary(py4, "p_sg", "SGLT2i (from May 2021)")
+)
+write_out(prev, "class_prevalence_by_year.csv", "n_py")
+show_tab(suppress_small(prev, "n_py"), "Prevalence (percent of patient-years on the class) and dose intensity among users")
+```
+
+```{r fig-prev, fig.cap = "Percent of patient-years on each evidence-based class (SGLT2i from May 2021)."}
+p2 <- prev %>% filter(n_py >= 10) %>%
+  ggplot(aes(year, pct_on, colour = class)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = yrs) +
+  scale_colour_manual(values = MetBrewer::met.brewer("Hiroshige", 4)) +
+  labs(x = "Calendar year", y = "Percent on class", colour = NULL) +
+  theme_minimal()
+save_fig(p2, "fig2_class_prevalence", h = 4.8)
+```
+
+### 5.3 Breadth versus depth (descriptive)
+
+Breadth is the number of the three fixed classes on therapy (0 to 3). Depth is the mean percent of target across the classes on therapy. This is a descriptive table only; the outcome test belongs to Part B.
+
+```{r breadth}
+py3$n_on <- (py3$p_ras > 0) + (py3$p_bb > 0) + (py3$p_mra > 0)
+breadth <- py3 %>% group_by(year, n_on) %>% summarise(n = n(), .groups = "drop") %>%
+  group_by(year) %>% mutate(pct = round(100 * n / sum(n), 1)) %>% ungroup()
+depth <- py3 %>% filter(n_on > 0) %>%
+  mutate(depth = (p_ras + p_bb + p_mra) / n_on) %>%
+  group_by(year) %>% summarise(n_py_on = n(), mean_depth_pct = round(100 * mean(depth), 1), .groups = "drop")
+breadth_wide <- breadth %>% select(year, n_on, pct) %>%
+  pivot_wider(names_from = n_on, values_from = pct, names_prefix = "classes_on_")
+breadth_tab <- breadth_wide %>% left_join(depth, by = "year")
+write_out(breadth_tab, "breadth_depth_by_year.csv", "n_py_on")
+show_tab(breadth_tab, "Breadth (percent of patient-years by number of classes on therapy) and depth")
+```
+
+```{r fig-breadth, fig.cap = "Breadth: percent of patient-years by number of fixed classes on therapy."}
+p3 <- breadth %>% filter(n >= 10) %>%
+  mutate(n_on = factor(n_on, levels = 0:3)) %>%
+  ggplot(aes(year, pct, fill = n_on)) +
+  geom_col() +
+  scale_x_continuous(breaks = yrs) +
+  scale_fill_manual(values = MetBrewer::met.brewer("Hokusai1", 4)) +
+  labs(x = "Calendar year", y = "Percent of patient-years", fill = "Classes on") +
+  theme_minimal()
+save_fig(p3, "fig3_breadth")
+```
+
+### 5.4 Gap decomposition (descriptive)
+
+Each class contributes (100/3) × (1 − score) to the gap from 100. The part from classes at 0 is underuse (including non-evidence agents, which score 0). The part from classes between 0 and 100 percent is underdosing. Totals reconcile to 100 − KCMO, shown as a check.
+
+```{r gap}
+u <- function(p) (100 / 3) * (p == 0)
+dd <- function(p) (100 / 3) * (1 - p) * (p > 0 & p < 1)
+py3$gap_underuse <- u(py3$p_ras) + u(py3$p_bb) + u(py3$p_mra)
+py3$gap_underdose <- dd(py3$p_ras) + dd(py3$p_bb) + dd(py3$p_mra)
+gap_tab <- py3 %>% group_by(year) %>% summarise(
+  n_py = n(),
+  mean_gap = round(mean(100 - val), 2),
+  mean_underuse = round(mean(gap_underuse), 2),
+  mean_underdosing = round(mean(gap_underdose), 2),
+  reconciles = abs(mean(100 - val) - mean(gap_underuse + gap_underdose)) < 1e-6,
+  .groups = "drop")
+write_out(gap_tab, "gap_decomposition_by_year.csv", "n_py")
+show_tab(suppress_small(gap_tab, "n_py"), "Gap from 100 decomposed into underuse and underdosing (mean points)")
+```
+
+```{r fig-gap, fig.cap = "Gap from 100 by year, split into underuse and underdosing."}
+p4 <- gap_tab %>% filter(n_py >= 10) %>%
+  select(year, mean_underuse, mean_underdosing) %>%
+  pivot_longer(c(mean_underuse, mean_underdosing), names_to = "component", values_to = "points") %>%
+  mutate(component = case_when(component == "mean_underuse" ~ "Underuse", TRUE ~ "Underdosing")) %>%
+  ggplot(aes(year, points, fill = component)) +
+  geom_area() +
+  scale_x_continuous(breaks = yrs) +
+  scale_fill_manual(values = okabe_ito[1:2]) +
+  labs(x = "Calendar year", y = "Mean gap (points)", fill = NULL) +
+  theme_minimal()
+save_fig(p4, "fig4_gap")
+```
+
+## 6. Titration and down-titration (descriptive, SAP §6.7)
+
+RAS, beta-blocker, and MRA only. SGLT2i is binary in this analysis, so titration does not apply to it.
+
+Patient-classes with at least two valid rows. Reached: peak score at or above 0.50 (or 1.00). Reduction: a later valid row with the class still in use and the score at least 0.25 below the peak. Discontinuation after reaching the threshold is counted separately. The registry has no reason-for-reduction field, so these are dose changes, not documented intolerance.
+
+```{r titration}
+rr <- rows[rows$ras_ok, ]
+tl <- bind_rows(
+  data.frame(lopnr = rr$lopnr, date = rr$date, cls = "RAS", p = rr$p_ras, on = rr$ras_on, stringsAsFactors = FALSE),
+  data.frame(lopnr = rows$lopnr[rows$bb_valid], date = rows$date[rows$bb_valid], cls = "BB",
+             p = rows$p_bb[rows$bb_valid], on = rows$bb_on[rows$bb_valid], stringsAsFactors = FALSE),
+  data.frame(lopnr = rows$lopnr[rows$mra_valid], date = rows$date[rows$mra_valid], cls = "MRA",
+             p = rows$p_mra[rows$mra_valid], on = rows$mra_on[rows$mra_valid], stringsAsFactors = FALSE),
+  NULL   # SGLT2i is binary (on = 1): titration does not apply
+)
+tl <- tl[order(tl$lopnr, tl$cls, tl$date), ]
+tl$n_valid <- ave(seq_len(nrow(tl)), tl$lopnr, tl$cls, FUN = length)
+tl$peak <- ave(tl$p, tl$lopnr, tl$cls, FUN = cummax)
+tl2 <- tl[tl$n_valid >= 2, ]
+
+tit_one <- function(thr) {
+  key <- paste(tl2$lopnr, tl2$cls)
+  res <- lapply(split(tl2, key), function(z) {
+    hi <- z$peak >= thr
+    red <- hi & z$on & z$p <= z$peak - 0.25
+    t_reach <- if (any(hi)) min(z$date[hi]) else as.Date(NA)
+    t_red <- if (any(red)) min(z$date[red]) else as.Date(NA)
+    disc <- if (is.na(t_reach)) FALSE else any(hi & !z$on & z$date > t_reach)
+    data.frame(cls = z$cls[1], reached = !is.na(t_reach), reduced = !is.na(t_red),
+               days_to_reduction = if (!is.na(t_red) && !is.na(t_reach)) as.numeric(t_red - t_reach) else NA_real_,
+               discontinued = disc, stringsAsFactors = FALSE)
+  })
+  pc <- do.call(rbind, res)
+  pc %>% group_by(cls) %>% summarise(
+    n_patient_classes = n(),
+    n_reached = sum(reached),
+    n_reduced = sum(reduced & reached),
+    pct_reduced_of_reached = round(100 * sum(reduced & reached) / sum(reached), 1),
+    median_days_to_reduction = round(median(days_to_reduction, na.rm = TRUE), 0),
+    n_discontinued = sum(discontinued),
+    .groups = "drop") %>%
+    mutate(threshold = thr)
+}
+tit <- bind_rows(tit_one(0.5), tit_one(1.0))
+write_out(tit, "titration_summary.csv", c("n_patient_classes", "n_reached", "n_reduced", "n_discontinued"))
+show_tab(suppress_small(tit, c("n_patient_classes", "n_reached", "n_reduced", "n_discontinued")),
+         "Titration and down-titration (threshold 0.50 and 1.00 of target; counts under 10 suppressed)")
+```
+
+## 7. Within-patient change (descriptive, SAP §6.6)
+
+Patients with at least two valid three-class rows: change from first to last valid value. Descriptive only.
+
+```{r within}
+vr <- rows[rows$k3_ok, ]
+vr <- vr[order(vr$lopnr, vr$date), ]
+pt <- vr %>% group_by(lopnr) %>% summarise(
+  n_valid = n(), first_val = kcmo3[1], last_val = kcmo3[n()],
+  d_first = min(date), d_last = max(date), .groups = "drop")
+multi <- pt %>% filter(n_valid >= 2) %>% mutate(
+  delta = last_val - first_val,
+  years_between = as.numeric(d_last - d_first) / 365.25,
+  change = case_when(abs(delta) < 5 ~ "stable",
+                     abs(delta) <= 10 ~ "modest",
+                     TRUE ~ "large"),
+  direction = case_when(delta > 0 ~ "up", delta < 0 ~ "down", TRUE ~ "no change"))
+within_sum <- data.frame(
+  patients_any_valid = nrow(pt),
+  patients_2plus_valid = nrow(multi),
+  pct_2plus = round(100 * nrow(multi) / nrow(pt), 1),
+  median_valid_rows_2plus = median(multi$n_valid),
+  median_years_first_to_last = round(median(multi$years_between), 2),
+  pct_change_stable_under5 = round(100 * mean(multi$change == "stable"), 1),
+  pct_change_modest_5to10 = round(100 * mean(multi$change == "modest"), 1),
+  pct_change_large_over10 = round(100 * mean(multi$change == "large"), 1),
+  pct_up = round(100 * mean(multi$direction == "up"), 1),
+  pct_down = round(100 * mean(multi$direction == "down"), 1),
+  median_change_points = round(median(multi$delta), 2),
+  stringsAsFactors = FALSE)
+rows_dist <- data.frame(
+  valid_rows = c("1", "2", "3", "4 or more"),
+  n_patients = as.integer(table(cut(pt$n_valid, c(0, 1, 2, 3, Inf), labels = c("1", "2", "3", "4 or more"))))
+)
+write_out(within_sum, "within_patient_change.csv", c("patients_any_valid", "patients_2plus_valid"))
+write_out(rows_dist, "valid_rows_per_patient.csv", "n_patients")
+show_tab(suppress_small(within_sum, c("patients_any_valid", "patients_2plus_valid")), "Within-patient change in fixed three-class KCMO")
+show_tab(suppress_small(rows_dist, "n_patients"), "Valid rows per patient")
+```
+
+```{r fig-within, fig.cap = "Within-patient change in fixed three-class KCMO (last minus first valid row)."}
+p5 <- multi %>% ggplot(aes(delta)) +
+  geom_histogram(binwidth = 5, boundary = 0) +
+  labs(x = "Change in KCMO Score", y = "Patients") +
+  theme_minimal()
+save_fig(p5, "fig5_within_change")
+```
+
+## 8. Trend models (SAP §7.2)
+
+Primary model: GEE on one row per patient-year, identity link, exchangeable correlation, clustered by patient. Calendar year is continuous. Adjusted for age, sex, and NYHA class (complete cases). Change is reported as the 2014 to 2025 difference (11 years). Piecewise slopes use known era boundaries (2016, 2021, 2024), not estimated joinpoints.
+
+Sensitivity models vary the row rule, the working correlation, and the target convention. The era-standardized series is shown for completeness, but its level is not comparable with the fixed series.
+
+```{r models}
+read_extract <- function(path) {
+  if (grepl("\\.(RData|rda)$", path, ignore.case = TRUE)) {
+    e <- new.env(); load(path, envir = e); get(ls(e)[1], envir = e)
+  } else {
+    read.csv(path, stringsAsFactors = FALSE)
+  }
+}
+gee_prep <- function(dat, valcol) {
+  x <- dat[!is.na(dat[[valcol]]) & !is.na(dat$age) & !is.na(dat$female) & !is.na(dat$nyha_hi), ]
+  x$val <- x[[valcol]]
+  x <- x[order(x$lopnr, x$year), ]
+  x$yr <- x$year - 2014
+  x$age_c <- x$age - 72
+  x$nyha_hi <- as.integer(x$nyha_hi)
+  x$pid <- as.integer(factor(x$lopnr))   # geepack is very slow with character cluster IDs
+  x$h16 <- pmax(x$year - 2016, 0)
+  x$h21 <- pmax(x$year - 2021, 0)
+  x$h24 <- pmax(x$year - 2024, 0)
+  x
+}
+gee_trend <- function(x, corstr, label) {
+  fit <- geeglm(val ~ yr + age_c + female + nyha_hi, id = pid, data = x,
+                family = gaussian(), corstr = corstr)
+  b  <- coef(fit)["yr"]
+  se <- sqrt(vcov(fit)["yr", "yr"])
+  data.frame(model = label, working_corr = corstr,
+             n_py = nrow(x), n_patients = length(unique(x$lopnr)),
+             change_2014_to_2025 = round(11 * b, 2),
+             lo_95 = round(11 * (b - 1.96 * se), 2),
+             hi_95 = round(11 * (b + 1.96 * se), 2),
+             stringsAsFactors = FALSE)
+}
+pw_slopes <- function(x) {
+  fit <- geeglm(val ~ yr + h16 + h21 + h24 + age_c + female + nyha_hi, id = pid, data = x,
+                family = gaussian(), corstr = "exchangeable")
+  nm <- c("yr", "h16", "h21", "h24")
+  b <- coef(fit)[nm]
+  V <- vcov(fit)[nm, nm]
+  L <- rbind(c(1, 0, 0, 0), c(1, 1, 0, 0), c(1, 1, 1, 0), c(1, 1, 1, 1))
+  est <- as.vector(L %*% b)
+  se  <- sqrt(diag(L %*% V %*% t(L)))
+  data.frame(era = c("2014-2015", "2016-2020", "2021-2023", "2024-2025"),
+             slope_points_per_year = round(est, 2),
+             lo_95 = round(est - 1.96 * se, 2),
+             hi_95 = round(est + 1.96 * se, 2),
+             stringsAsFactors = FALSE)
+}
+
+x_latest <- gee_prep(py3, "val")
+raw_dat  <- read_extract(params$data_path)
+P_alt    <- build_rows(raw_dat, !params$esc_all)
+py3_alt  <- pick_py(P_alt$rows, "kcmo3", "latest")
+alt_label <- if (params$esc_all) "S2: shfdb5 targets (alternate)" else "S2: ESC targets throughout"
+
+trend_sens <- rbind(
+  gee_trend(x_latest, "exchangeable", "Primary: fixed 3-class, latest row per year"),
+  gee_trend(x_latest, "independence", "Independence working correlation"),
+  gee_trend(gee_prep(py3_high, "val"), "exchangeable", "D10 sensitivity: highest row per year"),
+  gee_trend(gee_prep(py3_first, "val"), "exchangeable", "S6: first row per year"),
+  gee_trend(gee_prep(py3_alt, "val"), "exchangeable", alt_label),
+  gee_trend(gee_prep(era_py, "era_val"), "exchangeable", "Era-standardized series (level not comparable)")
+)
+write_out(trend_sens, "gee_trend_sensitivity.csv", "n_py")
+show_tab(suppress_small(trend_sens, "n_py"), "GEE trend estimates: 2014 to 2025 change in KCMO points (95% CI)")
+
+pw <- pw_slopes(x_latest)
+write_out(pw, "piecewise_slopes.csv")
+show_tab(pw, "Piecewise linear slopes by guideline era (points per year, 95% CI)")
+```
+
+## 9. Table 5: non-core therapy (descriptive, outside the score)
+
+Digoxin, sinus-node inhibitor (ivabradine), and any nitrate. Vericiguat and hydralazine/isosorbide dinitrate are not identifiable in the current dictionary (Q18).
+
+```{r table5}
+noncore <- py3 %>% group_by(year) %>% summarise(
+  n_py = n(),
+  pct_digoxin = round(100 * mean(dig), 1),
+  pct_sinus_node_inhibitor_ivabradine = round(100 * mean(ivab), 1),
+  pct_any_nitrate = round(100 * mean(nitr), 1),
+  .groups = "drop")
+write_out(noncore, "table5_noncore.csv", "n_py")
+show_tab(suppress_small(noncore, "n_py"), "Table 5: non-core therapy, percent of patient-years (outside the score)")
+```
+
+## 10. Completeness figure
+
+```{r fig-compl, fig.cap = "Percent non-missing for dose and eligibility-related fields by year."}
+p6 <- compl %>% filter(n_rows >= 10, field %in% c("ARNi dose string (use = Yes)", "MRA dose (use = Yes)",
+                                                  "SGLT2i dose (use = Yes)", "LVEF", "eGFR (CKD-EPI 2021)",
+                                                  "Potassium")) %>%
+  ggplot(aes(year, pct_nonmissing, colour = field)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = yrs) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "Calendar year", y = "Percent non-missing", colour = NULL) +
+  theme_minimal()
+save_fig(p6, "fig6_completeness", h = 4.8)
+```
+
+## 11. Run record and output files
+
+Send back the contents of `outputs/` (CSV tables and figures) and this rendered HTML. Do not send the data.
+
+```{r run-record}
+run_info <- data.frame(
+  item = c("R version", "dplyr", "ggplot2", "geepack", "data_path (basename only)", "esc_all", "outpatient_value"),
+  value = c(R.version.string,
+            as.character(packageVersion("dplyr")), as.character(packageVersion("ggplot2")),
+            as.character(packageVersion("geepack")), basename(params$data_path),
+            as.character(params$esc_all), params$outpatient_value),
+  stringsAsFactors = FALSE)
+show_tab(run_info, "Run record")
+cat("Output files:\n")
+cat(paste0("  ", list.files(params$outputs_dir, recursive = TRUE)), sep = "\n")
+```
+
+## Limitations stated in this analysis
+
+- Eligibility: all classes are treated as eligible (SAP L1). Contraindication fields are not available; this will be revisited once Q3 is answered.
+- Prescribed, not taken: registry doses are prescribed doses.
+- The fixed three-class series is the comparability check; the era-standardized series changes definition in 2021 (SGLT2i added), so its level is not comparable across that boundary.
+- The registry does not record a reason for dose reduction, so down-titration is a dose change, not an intolerance.
+- Population: outpatients with EF below 40 percent (D11) and HF duration of at least 90 days.
