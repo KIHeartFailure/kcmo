@@ -13,7 +13,7 @@ execute:
   warning: false
   message: false
 params:
-  data_path: "PATH/TO/EXTRACT.RData"       # Lina: point to your local extract (.RData or .csv). Do not send the path by email.
+  data_path: "P:/k2_stat_heartfailure/Projects/20210525_shfdb4/dm/data/v423/rsdata423.RData"       # Lina: point to your local extract (.RData or .csv). Do not send the path by email.
   year_max: 2023                          # last calendar year in the extract. Set to 2025 when 2024-2025 rows arrive.
   outpatient_value: "Out-patient"         # value of shf_location for outpatient rows (confirm, Q4)
   esc_all: false                          # FALSE = shfdb4 targets (primary). TRUE = ESC convention for all drugs.
@@ -316,7 +316,8 @@ build_rows <- function(dat, esc_all) {
   d <- d[!is.na(d$shf_location) & d$shf_location == params$outpatient_value, ]
   flow$rows_outpatient <- cnt(d$year)
 
-  d <- d[!is.na(d$shf_ef) & d$shf_ef < 40 & !is.na(d$sos_durationhf) & d$sos_durationhf >= 90, ]
+  # LB comment: see previous code comment about continous and categorical EF
+  d <- d[!is.na(d$shf_ef) & d$shf_ef %in% c("<30", "30-39") & !is.na(d$sos_durationhf) & d$sos_durationhf >= 90, ] 
   flow$rows_ef_duration <- cnt(d$year)
 
   yes1 <- function(x) !is.na(x) & x == "Yes"
